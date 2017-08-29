@@ -176,6 +176,7 @@ class WebRequest(http.Request):
                 except self.factory.channel_layer.ChannelFull:
                     # Channel is too full; reject request with 503
                     self.basic_error(503, b"Service Unavailable", "Request queue full.")
+                    logger.error("Channels layer full")
         except Exception:
             logger.error(traceback.format_exc())
             self.basic_error(500, b"Internal Server Error", "HTTP processing error")
