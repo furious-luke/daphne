@@ -1,20 +1,14 @@
 from __future__ import unicode_literals
 
 import logging
-import random
 import six
-import string
 import time
 import traceback
 
-from zope.interface import implementer
-
 from six.moves.urllib_parse import unquote, unquote_plus
-from twisted.internet.interfaces import IProtocolNegotiationFactory
 from twisted.protocols.policies import ProtocolWrapper
 from twisted.web import http
 
-from .utils import parse_x_forwarded_for
 from .ws_protocol import WebSocketProtocol, WebSocketFactory
 
 logger = logging.getLogger(__name__)
@@ -49,21 +43,22 @@ class WebRequest(http.Request):
     """.replace("\n", "").replace("    ", " ").replace("   ", " ").replace("  ", " ")  # Shorten it a bit, bytes wise
 
     def __init__(self, *args, **kwargs):
-        try:
-            http.Request.__init__(self, *args, **kwargs)
-            # Easy factory link
-            self.factory = self.channel.factory
-            # Make a name for our reply channel
-            self.reply_channel = self.factory.make_send_channel()
-            # Tell factory we're that channel's client
-            self.last_keepalive = time.time()
-            self.factory.reply_protocols[self.reply_channel] = self
-            self._got_response_start = False
-        except Exception:
-            logger.error(traceback.format_exc())
-            raise
+        self.server = kwargs.pop('server', None)
+        http.Request.__init__(self, *args, **kwargs)
+        # Easy factory link
+        self.factory = self.channel.factory
+        # Make a name for our reply channel
+        self.reply_channel = self.factory.channel_layer.new_channel("http.response!")
+        # Tell factory we're that channel's client
+        self.last_keepalive = time.time()
+        self.factory.reply_protocols[self.reply_channel] = self
+        self._got_response_start = False
 
     def process(self):
+        with self.server.timer.work('daphne.idle'):
+            self._do_process()
+
+    def _do_process(self):
         try:
             self.request_start = time.time()
             # Get upgrade header
@@ -72,22 +67,11 @@ class WebRequest(http.Request):
                 upgrade_header = self.requestHeaders.getRawHeaders(b"Upgrade")[0]
             # Get client address if possible
             if hasattr(self.client, "host") and hasattr(self.client, "port"):
-                # client.host and host.host are byte strings in Python 2, but spec
-                # requires unicode string.
-                self.client_addr = [six.text_type(self.client.host), self.client.port]
-                self.server_addr = [six.text_type(self.host.host), self.host.port]
+                self.client_addr = [self.client.host, self.client.port]
+                self.server_addr = [self.host.host, self.host.port]
             else:
                 self.client_addr = None
                 self.server_addr = None
-
-            if self.factory.proxy_forwarded_address_header:
-                self.client_addr = parse_x_forwarded_for(
-                    self.requestHeaders,
-                    self.factory.proxy_forwarded_address_header,
-                    self.factory.proxy_forwarded_port_header,
-                    self.client_addr
-                )
-
             # Check for unicodeish path (or it'll crash when trying to parse)
             try:
                 self.path.decode("ascii")
@@ -108,8 +92,6 @@ class WebRequest(http.Request):
                     self.setResponseCode(500)
                     logger.warn("Could not make WebSocket protocol")
                     self.finish()
-                # Give it the raw query string
-                protocol._raw_query_string = self.query_string
                 # Port across transport
                 protocol.set_main_factory(self.factory)
                 transport, self.transport = self.transport, None
@@ -134,11 +116,7 @@ class WebRequest(http.Request):
                 del self.factory.reply_protocols[self.reply_channel]
                 self.reply_channel = None
                 # Resume the producer so we keep getting data, if it's available as a method
-                # 17.1 version
-                if hasattr(self.channel, "_networkProducer"):
-                    self.channel._networkProducer.resumeProducing()
-                # 16.x version
-                elif hasattr(self.channel, "resumeProducing"):
+                if hasattr(self.channel, "resumeProducing"):
                     self.channel.resumeProducing()
 
             # Boring old HTTP.
@@ -162,11 +140,11 @@ class WebRequest(http.Request):
                     self.factory.channel_layer.send("http.request", {
                         "reply_channel": self.reply_channel,
                         # TODO: Correctly say if it's 1.1 or 1.0
-                        "http_version": self.clientproto.split(b"/")[-1].decode("ascii"),
+                        "http_version": "1.1",
                         "method": self.method.decode("ascii"),
                         "path": self.unquote(self.path),
                         "root_path": self.root_path,
-                        "scheme": "https" if self.isSecure() else "http",
+                        "scheme": "http",
                         "query_string": self.query_string,
                         "headers": self.clean_headers,
                         "body": self.content.read(),
@@ -176,7 +154,6 @@ class WebRequest(http.Request):
                 except self.factory.channel_layer.ChannelFull:
                     # Channel is too full; reject request with 503
                     self.basic_error(503, b"Service Unavailable", "Request queue full.")
-                    logger.error("Channels layer full")
         except Exception:
             logger.error(traceback.format_exc())
             self.basic_error(500, b"Internal Server Error", "HTTP processing error")
@@ -202,15 +179,13 @@ class WebRequest(http.Request):
         Sends a disconnect message on the http.disconnect channel.
         Useful only really for long-polling.
         """
-        # If we don't yet have a path, then don't send as we never opened.
-        if self.path:
-            try:
-                self.factory.channel_layer.send("http.disconnect", {
-                    "reply_channel": self.reply_channel,
-                    "path": self.unquote(self.path),
-                })
-            except self.factory.channel_layer.ChannelFull:
-                pass
+        try:
+            self.factory.channel_layer.send("http.disconnect", {
+                "reply_channel": self.reply_channel,
+                "path": self.unquote(self.path),
+            })
+        except self.factory.channel_layer.ChannelFull:
+            pass
 
     def connectionLost(self, reason):
         """
@@ -236,12 +211,11 @@ class WebRequest(http.Request):
         """
         Writes a received HTTP response back out to the transport.
         """
-        if not self._got_response_start:
+        if "status" in message:
+            if self._got_response_start:
+                raise ValueError("Got multiple Response messages for %s!" % self.reply_channel)
             self._got_response_start = True
-            if 'status' not in message:
-                raise ValueError("Specifying a status code is required for a Response message.")
-
-            # Set HTTP status code
+            # Write code
             self.setResponseCode(message['status'])
             # Write headers
             for header, value in message.get("headers", {}):
@@ -250,13 +224,9 @@ class WebRequest(http.Request):
                     header = header.encode("latin1")
                 self.responseHeaders.addRawHeader(header, value)
             logger.debug("HTTP %s response started for %s", message['status'], self.reply_channel)
-        else:
-            if 'status' in message:
-                raise ValueError("Got multiple Response messages for %s!" % self.reply_channel)
-
         # Write out body
-        http.Request.write(self, message.get('content', b''))
-
+        if "content" in message:
+            http.Request.write(self, message['content'])
         # End if there's no more content
         if not message.get("more_content", False):
             self.finish()
@@ -294,13 +264,25 @@ class WebRequest(http.Request):
                 (b"Content-Type", b"text/html; charset=utf-8"),
             ],
             "content": (self.error_template % {
-                "title": six.text_type(status) + " " + status_text.decode("ascii"),
+                "title": str(status) + " " + status_text.decode("ascii"),
                 "body": body,
             }).encode("utf8"),
         })
 
 
-@implementer(IProtocolNegotiationFactory)
+class HTTPProtocol(http.HTTPChannel):
+
+    # requestFactory = WebRequest
+
+    def __init__(self, *args, **kwargs):
+        self.server = kwargs.pop('server', None)
+        self.requestFactory = self.get_request
+        super().__init__(*args, **kwargs)
+
+    def get_request(self, *args, **kwargs):
+        return WebRequest(*args, server=self.server, **kwargs)
+
+
 class HTTPFactory(http.HTTPFactory):
     """
     Factory which takes care of tracking which protocol
@@ -309,66 +291,37 @@ class HTTPFactory(http.HTTPFactory):
     routed appropriately.
     """
 
-    def __init__(self, channel_layer, action_logger=None, send_channel=None, timeout=120, websocket_timeout=86400, ping_interval=20, ping_timeout=30, ws_protocols=None, root_path="", websocket_connect_timeout=30, proxy_forwarded_address_header=None, proxy_forwarded_port_header=None, websocket_handshake_timeout=5):
+    # protocol = HTTPProtocol
+
+    def __init__(self, channel_layer, action_logger=None, timeout=120, websocket_timeout=86400, ping_interval=20, ping_timeout=30, ws_protocols=None, root_path="", websocket_connect_timeout=30, server=None):
+        self.server = server
+        self.protocol = self.get_protocol
         http.HTTPFactory.__init__(self)
         self.channel_layer = channel_layer
         self.action_logger = action_logger
-        self.send_channel = send_channel
-        assert self.send_channel is not None
         self.timeout = timeout
         self.websocket_timeout = websocket_timeout
         self.websocket_connect_timeout = websocket_connect_timeout
         self.ping_interval = ping_interval
-        self.proxy_forwarded_address_header = proxy_forwarded_address_header
-        self.proxy_forwarded_port_header = proxy_forwarded_port_header
         # We track all sub-protocols for response channel mapping
         self.reply_protocols = {}
         # Make a factory for WebSocket protocols
-        self.ws_factory = WebSocketFactory(self, protocols=ws_protocols, server='Daphne')
-        self.ws_factory.setProtocolOptions(
-            autoPingTimeout=ping_timeout,
-            allowNullOrigin=True,
-            openHandshakeTimeout=websocket_handshake_timeout
-        )
+        self.ws_factory = WebSocketFactory(self, protocols=ws_protocols)
+        self.ws_factory.setProtocolOptions(autoPingTimeout=ping_timeout)
         self.ws_factory.protocol = WebSocketProtocol
         self.ws_factory.reply_protocols = self.reply_protocols
         self.root_path = root_path
 
-    def buildProtocol(self, addr):
-        """
-        Builds protocol instances. This override is used to ensure we use our
-        own Request object instead of the default.
-        """
-        try:
-            protocol = http.HTTPFactory.buildProtocol(self, addr)
-            protocol.requestFactory = WebRequest
-            return protocol
-        except Exception as e:
-            logger.error("Cannot build protocol: %s" % traceback.format_exc())
-            raise
-
-    def make_send_channel(self):
-        """
-        Makes a new send channel for a protocol with our process prefix.
-        """
-        protocol_id = "".join(random.choice(string.ascii_letters) for i in range(10))
-        return self.send_channel + protocol_id
+    def get_protocol(self, *args, **kwargs):
+        return HTTPProtocol(*args, server=self.server, **kwargs)
 
     def reply_channels(self):
         return self.reply_protocols.keys()
 
     def dispatch_reply(self, channel, message):
-        # If we don't know about the channel, ignore it (likely a channel we
-        # used to have that's now in a group).
-        # TODO: Find a better way of alerting people when this happens so
-        # they can do more cleanup, that's not an error.
-        if channel not in self.reply_protocols:
-            logger.debug("Message on unknown channel %r - discarding" % channel)
-            return
-
-        if isinstance(self.reply_protocols[channel], WebRequest):
+        if channel.startswith("http") and isinstance(self.reply_protocols[channel], WebRequest):
             self.reply_protocols[channel].serverResponse(message)
-        elif isinstance(self.reply_protocols[channel], WebSocketProtocol):
+        elif channel.startswith("websocket") and isinstance(self.reply_protocols[channel], WebSocketProtocol):
             # Switch depending on current socket state
             protocol = self.reply_protocols[channel]
             # See if the message is valid
@@ -381,33 +334,19 @@ class HTTPFactory(http.HTTPFactory):
                         unknown_keys,
                     )
                 )
-            # Accepts allow bytes/text afterwards
             if message.get("accept", None) and protocol.state == protocol.STATE_CONNECTING:
                 protocol.serverAccept()
-            # Rejections must be the only thing
-            if message.get("accept", None) == False and protocol.state == protocol.STATE_CONNECTING:
-                protocol.serverReject()
-                return
-            # You're only allowed one of bytes or text
-            if message.get("bytes", None) and message.get("text", None):
-                raise ValueError(
-                    "Got invalid WebSocket reply message on %s - contains both bytes and text keys" % (
-                        channel,
-                    )
-                )
             if message.get("bytes", None):
                 protocol.serverSend(message["bytes"], True)
             if message.get("text", None):
                 protocol.serverSend(message["text"], False)
-
-            closing_code = message.get("close", False)
-            if closing_code:
+            if message.get("close", False):
                 if protocol.state == protocol.STATE_CONNECTING:
                     protocol.serverReject()
                 else:
-                    protocol.serverClose(code=closing_code)
+                    protocol.serverClose()
         else:
-            raise ValueError("Unknown protocol class")
+            raise ValueError("Cannot dispatch message on channel %r" % channel)
 
     def log_action(self, protocol, action, details):
         """
@@ -428,23 +367,8 @@ class HTTPFactory(http.HTTPFactory):
             # WebSocket timeout checking and keepalive ping sending
             elif isinstance(protocol, WebSocketProtocol):
                 # Timeout check
-                if protocol.duration() > self.websocket_timeout and self.websocket_timeout >= 0:
+                if protocol.duration() > self.websocket_timeout:
                     protocol.serverClose()
                 # Ping check
                 else:
                     protocol.check_ping()
-
-    # IProtocolNegotiationFactory
-    def acceptableProtocols(self):
-        """
-        Protocols this server can speak after ALPN negotiation. Currently that
-        is HTTP/1.1 and optionally HTTP/2. Websockets cannot be negotiated
-        using ALPN, so that doesn't go here: anyone wanting websockets will
-        negotiate HTTP/1.1 and then do the upgrade dance.
-        """
-        baseProtocols = [b'http/1.1']
-
-        if http.H2_ENABLED:
-            baseProtocols.insert(0, b'h2')
-
-        return baseProtocols

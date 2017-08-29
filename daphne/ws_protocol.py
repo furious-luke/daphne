@@ -4,12 +4,10 @@ import logging
 import six
 import time
 import traceback
-from six.moves.urllib_parse import unquote
+from six.moves.urllib_parse import unquote, urlencode
 from twisted.internet import defer
 
 from autobahn.twisted.websocket import WebSocketServerProtocol, WebSocketServerFactory, ConnectionDeny
-
-from .utils import parse_x_forwarded_for
 
 logger = logging.getLogger(__name__)
 
@@ -42,34 +40,26 @@ class WebSocketProtocol(WebSocketServerProtocol):
                 if b"_" in name:
                     continue
                 self.clean_headers.append((name.lower(), value.encode("latin1")))
+            # Reconstruct query string
+            # TODO: get autobahn to provide it raw
+            query_string = urlencode(request.params, doseq=True).encode("ascii")
             # Make sending channel
-            self.reply_channel = self.main_factory.make_send_channel()
+            self.reply_channel = self.channel_layer.new_channel("websocket.send!")
             # Tell main factory about it
             self.main_factory.reply_protocols[self.reply_channel] = self
             # Get client address if possible
-            peer = self.transport.getPeer()
-            host = self.transport.getHost()
-            if hasattr(peer, "host") and hasattr(peer, "port"):
-                self.client_addr = [six.text_type(peer.host), peer.port]
-                self.server_addr = [six.text_type(host.host), host.port]
+            if hasattr(self.transport.getPeer(), "host") and hasattr(self.transport.getPeer(), "port"):
+                self.client_addr = [self.transport.getPeer().host, self.transport.getPeer().port]
+                self.server_addr = [self.transport.getHost().host, self.transport.getHost().port]
             else:
                 self.client_addr = None
                 self.server_addr = None
-
-            if self.main_factory.proxy_forwarded_address_header:
-                self.client_addr = parse_x_forwarded_for(
-                    self.http_headers,
-                    self.main_factory.proxy_forwarded_address_header,
-                    self.main_factory.proxy_forwarded_port_header,
-                    self.client_addr
-                )
-
             # Make initial request info dict from request (we only have it here)
             self.path = request.path.encode("ascii")
             self.request_info = {
                 "path": self.unquote(self.path),
                 "headers": self.clean_headers,
-                "query_string": self._raw_query_string,  # Passed by HTTP protocol
+                "query_string": self.unquote(query_string),
                 "client": self.client_addr,
                 "server": self.server_addr,
                 "reply_channel": self.reply_channel,
@@ -104,7 +94,7 @@ class WebSocketProtocol(WebSocketServerProtocol):
             # so drop the connection.
             self.muted = True
             logger.warn("WebSocket force closed for %s due to connect backpressure", self.reply_channel)
-            # Send code 503 "Service Unavailable" with close.
+            # Send code 1013 "try again later" with close.
             raise ConnectionDeny(code=503, reason="Connection queue at capacity")
         else:
             self.factory.log_action("websocket", "connecting", {
@@ -174,7 +164,7 @@ class WebSocketProtocol(WebSocketServerProtocol):
 
     def serverReject(self):
         """
-        Called when we get a message saying to reject the connection.
+        Called when we get a message saying to accept the connection.
         """
         self.handshake_deferred.errback(ConnectionDeny(code=403, reason="Access denied"))
         self.cleanup()
@@ -197,12 +187,11 @@ class WebSocketProtocol(WebSocketServerProtocol):
         else:
             self.sendMessage(content.encode("utf8"), binary)
 
-    def serverClose(self, code=True):
+    def serverClose(self):
         """
         Server-side channel message to close the socket
         """
-        code = 1000 if code is True else code
-        self.sendClose(code=code)
+        self.sendClose()
 
     def onClose(self, wasClean, code, reason):
         self.cleanup()
@@ -230,8 +219,7 @@ class WebSocketProtocol(WebSocketServerProtocol):
         Call to clean up this socket after it's closed.
         """
         if hasattr(self, "reply_channel"):
-            if self.reply_channel in self.factory.reply_protocols:
-                del self.factory.reply_protocols[self.reply_channel]
+            del self.factory.reply_protocols[self.reply_channel]
 
     def duration(self):
         """

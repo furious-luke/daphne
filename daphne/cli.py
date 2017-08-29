@@ -2,14 +2,12 @@ import sys
 import argparse
 import logging
 import importlib
-from .server import Server, build_endpoint_description_strings
+from .server import Server
 from .access import AccessLogGenerator
 
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HOST = '127.0.0.1'
-DEFAULT_PORT = 8000
 
 class CommandLineInterface(object):
     """
@@ -27,26 +25,14 @@ class CommandLineInterface(object):
             '--port',
             type=int,
             help='Port number to listen on',
-            default=None,
+            default=8000,
         )
         self.parser.add_argument(
             '-b',
             '--bind',
             dest='host',
             help='The host/address to bind to',
-            default=None,
-        )
-        self.parser.add_argument(
-            '--websocket_timeout',
-            type=int,
-            help='Maximum time to allow a websocket to be connected. -1 for infinite.',
-            default=None,
-        )
-        self.parser.add_argument(
-            '--websocket_connect_timeout',
-            type=int,
-            help='Maximum time to allow a connection to handshake. -1 for infinite',
-            default=5,
+            default="127.0.0.1",
         )
         self.parser.add_argument(
             '-u',
@@ -61,14 +47,6 @@ class CommandLineInterface(object):
             dest='file_descriptor',
             help='Bind to a file descriptor rather than a TCP host/port or named unix socket',
             default=None,
-        )
-        self.parser.add_argument(
-            '-e',
-            '--endpoint',
-            dest='socket_strings',
-            action='append',
-            help='Use raw server strings passed directly to twisted',
-            default=[],
         )
         self.parser.add_argument(
             '-v',
@@ -98,8 +76,12 @@ class CommandLineInterface(object):
         self.parser.add_argument(
             '--ping-timeout',
             type=int,
-            help='The number of seconds before a WebSocket is closed if no response to a keepalive ping',
+            help='The number of seconds before a WeSocket is closed if no response to a keepalive ping',
             default=30,
+        )
+        self.parser.add_argument(
+            'channel_layer',
+            help='The ASGI channel layer instance to use as path.to.module:instance.path',
         )
         self.parser.add_argument(
             '--ws-protocol',
@@ -114,27 +96,6 @@ class CommandLineInterface(object):
             help='The setting for the ASGI root_path variable',
             default="",
         )
-        self.parser.add_argument(
-            '--proxy-headers',
-            dest='proxy_headers',
-            help='Enable parsing and using of X-Forwarded-For and X-Forwarded-Port headers and using that as the '
-                 'client address',
-            default=False,
-            action='store_true',
-        )
-        self.parser.add_argument(
-            '--force-sync',
-            dest='force_sync',
-            action='store_true',
-            help='Force the server to use synchronous mode on its ASGI channel layer',
-            default=False,
-        )
-        self.parser.add_argument(
-            'channel_layer',
-            help='The ASGI channel layer instance to use as path.to.module:instance.path',
-        )
-
-        self.server = None
 
     @classmethod
     def entrypoint(cls):
@@ -174,45 +135,26 @@ class CommandLineInterface(object):
         channel_layer = importlib.import_module(module_path)
         for bit in object_path.split("."):
             channel_layer = getattr(channel_layer, bit)
-
-        if not any([args.host, args.port, args.unix_socket, args.file_descriptor, args.socket_strings]):
-            # no advanced binding options passed, patch in defaults
-            args.host = DEFAULT_HOST
-            args.port = DEFAULT_PORT
-        elif args.host and not args.port:
-            args.port = DEFAULT_PORT
-        elif args.port and not args.host:
-            args.host = DEFAULT_HOST
-
-        # build endpoint description strings from (optional) cli arguments
-        endpoints = build_endpoint_description_strings(
+        # Force enable the logger. It seems that Django can sometimes disable
+        # logging when imported.
+        logger.disabled = False
+        # Run server
+        logger.info(
+            "Starting server at %s, channel layer %s",
+            (args.unix_socket if args.unix_socket else "%s:%s" % (args.host, args.port)),
+            args.channel_layer,
+        )
+        Server(
+            channel_layer=channel_layer,
             host=args.host,
             port=args.port,
             unix_socket=args.unix_socket,
-            file_descriptor=args.file_descriptor
-        )
-        endpoints = sorted(
-            args.socket_strings + endpoints
-        )
-        logger.info(
-            'Starting server at %s, channel layer %s.' %
-            (', '.join(endpoints), args.channel_layer)
-        )
-
-        self.server = Server(
-            channel_layer=channel_layer,
-            endpoints=endpoints,
+            file_descriptor=args.file_descriptor,
             http_timeout=args.http_timeout,
             ping_interval=args.ping_interval,
             ping_timeout=args.ping_timeout,
-            websocket_timeout=args.websocket_timeout,
-            websocket_connect_timeout=args.websocket_connect_timeout,
             action_logger=AccessLogGenerator(access_log_stream) if access_log_stream else None,
             ws_protocols=args.ws_protocols,
             root_path=args.root_path,
             verbosity=args.verbosity,
-            proxy_forwarded_address_header='X-Forwarded-For' if args.proxy_headers else None,
-            proxy_forwarded_port_header='X-Forwarded-Port' if args.proxy_headers else None,
-            force_sync=args.force_sync,
-        )
-        self.server.run()
+        ).run()
