@@ -11,8 +11,10 @@ from twisted.logger import globalLogBeginner, STDLibLogObserver
 from twisted.web import http
 
 from .http_protocol import HTTPFactory
+from .metrics import MetricsThread
 
 logger = logging.getLogger(__name__)
+metrics_logger = logging.getLogger('metrics')
 
 
 class Server(object):
@@ -77,6 +79,9 @@ class Server(object):
         self.verbosity = verbosity
 
     def run(self):
+        # Before anything else, fire up the memory tracker.
+        self.metrics = MetricsThread(metrics_logger)
+        self.metrics.start()
         # Create process-local channel prefixes
         # TODO: Can we guarantee non-collision better?
         process_id = "".join(random.choice(string.ascii_letters) for i in range(10))
